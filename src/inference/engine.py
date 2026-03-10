@@ -138,7 +138,7 @@ class IndicF5InferenceEngine:
         try:
             self.device = torch.device(device)
             self._configure_runtime()
-            if self.model:
+            if self.model is not None:
                 self.model = self.model.to(self.device)
             logger.info(f"Models moved to device: {device}")
         except Exception as e:

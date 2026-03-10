@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local runtime artifacts
+outputs/history/*.wav
+profiles/**/*.wav
+profiles/metadata.json

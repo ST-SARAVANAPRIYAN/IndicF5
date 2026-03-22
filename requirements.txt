@@ -34,3 +34,5 @@ einx
 huggingface_hub
 python-dotenv
 torchcodec
+psutil
+threadpoolctl

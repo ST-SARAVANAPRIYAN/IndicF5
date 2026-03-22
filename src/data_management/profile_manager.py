@@ -1,5 +1,6 @@
 import os
 import json
+import glob
 import shutil
 import torch
 from pathlib import Path
@@ -158,7 +159,7 @@ class VoiceProfileManager:
         self,
         name: str,
         ref_text: Optional[str] = None,
-        audio_path: Optional[str] = None
+        audio_path: Optional[str] = None,
     ) -> bool:
         """
         Update an existing profile
@@ -184,7 +185,6 @@ class VoiceProfileManager:
                     raise FileNotFoundError(f"Audio file not found: {audio_path}")
                 
                 # Remove old audio
-                import glob
                 old_audio = glob.glob(str(profile_path / f"{self.AUDIO_FILENAME}.*"))
                 for f in old_audio:
                     os.remove(f)
@@ -196,7 +196,7 @@ class VoiceProfileManager:
                 profile["audio_path"] = str(target_audio_path)
             
             # Update text if provided
-            if ref_text:
+            if ref_text is not None:
                 profile["ref_text"] = ref_text
             
             profile["updated_at"] = datetime.now().isoformat()
@@ -208,16 +208,3 @@ class VoiceProfileManager:
         except Exception as e:
             logger.error(f"Failed to update profile '{name}': {str(e)}")
             return False
-
-    def list_profiles(self):
-        return list(self.metadata.keys())
-
-    def delete_profile(self, name):
-        if name in self.metadata:
-            profile_path = self.profiles_dir / name
-            if profile_path.exists():
-                shutil.rmtree(profile_path)
-            del self.metadata[name]
-            self._save_metadata()
-            return True
-        return False

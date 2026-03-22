@@ -177,3 +177,9 @@ cython_debug/
 outputs/history/*.wav
 profiles/**/*.wav
 profiles/metadata.json
+
+# Project runtime data (generated locally)
+profiles/
+outputs/
+logs/
+.cache/

@@ -3,6 +3,7 @@
 import os
 import tempfile
 import time
+import gc
 import contextlib
 from typing import Tuple
 
@@ -24,9 +25,137 @@ class IndicF5InferenceEngine:
         self.config = get_config()
         self.device = torch.device(self.config.get_device())
         self.model = None
+        self._compiled = False
+        self._cpu_optimized = False
         self._warmed_up = False
+        self._ref_preprocess_cache = {}
+        self._max_ref_cache_size = 32
+        # Apply global threadpool knobs early, so later CUDA->CPU switch is not constrained.
+        self._configure_cpu_runtime()
         self._configure_runtime()
         logger.info(f"IndicF5 inference engine initialized on device: {self.device}")
+
+    def _get_preprocessed_reference(self, ref_audio_path: str, ref_text: str):
+        """Cache preprocessed reference audio/text to avoid repeated CPU-heavy preprocessing."""
+        try:
+            stat = os.stat(ref_audio_path)
+            cache_key = (
+                os.path.abspath(ref_audio_path),
+                int(stat.st_mtime),
+                stat.st_size,
+                (ref_text or "").strip(),
+            )
+        except Exception:
+            cache_key = (os.path.abspath(ref_audio_path), (ref_text or "").strip())
+
+        cached = self._ref_preprocess_cache.get(cache_key)
+        if cached is not None:
+            cached_audio, cached_text = cached
+            if cached_audio and os.path.exists(cached_audio):
+                return cached_audio, cached_text
+
+        from f5_tts.infer.utils_infer import preprocess_ref_audio_text
+
+        pre_audio, pre_text = preprocess_ref_audio_text(ref_audio_path, ref_text)
+
+        self._ref_preprocess_cache[cache_key] = (pre_audio, pre_text)
+        if len(self._ref_preprocess_cache) > self._max_ref_cache_size:
+            oldest_key = next(iter(self._ref_preprocess_cache))
+            old_audio, _ = self._ref_preprocess_cache.pop(oldest_key)
+            try:
+                if old_audio and os.path.exists(old_audio):
+                    os.remove(old_audio)
+            except Exception:
+                pass
+
+        return pre_audio, pre_text
+
+    def _configure_cpu_runtime(self) -> None:
+        """Aggressive CPU runtime tuning for faster inference on low-end systems."""
+        cpu_threads = max(1, int(os.cpu_count() or 1))
+
+        # Thread env vars (best-effort)
+        os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+        os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+        os.environ["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+        os.environ["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+        os.environ["VECLIB_MAXIMUM_THREADS"] = str(cpu_threads)
+        os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
+        os.environ.setdefault("KMP_BLOCKTIME", "1")
+
+        try:
+            torch.set_num_threads(cpu_threads)
+            torch.set_num_interop_threads(max(1, cpu_threads // 2))
+        except Exception as e:
+            logger.warning(f"[CPU] torch thread tuning failed: {str(e)}")
+
+        if hasattr(torch.backends, "mkldnn"):
+            try:
+                torch.backends.mkldnn.enabled = True
+            except Exception:
+                pass
+
+        # Control external BLAS/OpenMP threadpools when available
+        try:
+            from threadpoolctl import threadpool_limits
+
+            threadpool_limits(limits=cpu_threads)
+        except Exception as e:
+            logger.debug(f"[CPU] threadpoolctl tuning skipped: {str(e)}")
+
+        # Pin process to all cores and prefer higher scheduling priority
+        try:
+            if hasattr(os, "sched_setaffinity"):
+                os.sched_setaffinity(0, set(range(cpu_threads)))
+        except Exception as e:
+            logger.debug(f"[CPU] affinity setup skipped: {str(e)}")
+
+        try:
+            import psutil
+
+            process = psutil.Process(os.getpid())
+            if hasattr(process, "cpu_affinity"):
+                process.cpu_affinity(list(range(cpu_threads)))
+            try:
+                process.nice(psutil.HIGH_PRIORITY_CLASS if os.name == "nt" else -10)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"[CPU] psutil priority/affinity tuning skipped: {str(e)}")
+
+        logger.info(
+            "[CPU] aggressive runtime: threads=%d interop_threads=%d mkldnn=%s",
+            torch.get_num_threads(),
+            torch.get_num_interop_threads(),
+            getattr(torch.backends, "mkldnn", None).enabled if hasattr(torch.backends, "mkldnn") else "n/a",
+        )
+
+    def _optimize_model_for_cpu(self) -> None:
+        """Apply optional CPU model optimizations."""
+        if self.model is None or self.device.type != "cpu" or self._cpu_optimized:
+            return
+
+        # Dynamic quantization (best-effort)
+        try:
+            self.model = torch.quantization.quantize_dynamic(
+                self.model,
+                {torch.nn.Linear},
+                dtype=torch.qint8,
+            )
+            logger.info("[CPU] dynamic quantization enabled for Linear layers")
+        except Exception as e:
+            logger.debug(f"[CPU] dynamic quantization skipped: {str(e)}")
+
+        # Intel Extension for PyTorch (optional)
+        try:
+            import intel_extension_for_pytorch as ipex
+
+            self.model = ipex.optimize(self.model, dtype=torch.float32, inplace=True)
+            logger.info("[CPU] Intel Extension for PyTorch optimization enabled")
+        except Exception as e:
+            logger.debug(f"[CPU] IPEX optimization skipped: {str(e)}")
+
+        self._cpu_optimized = True
 
     def _configure_runtime(self) -> None:
         """Apply runtime performance settings."""
@@ -39,6 +168,11 @@ class IndicF5InferenceEngine:
                 torch.set_float32_matmul_precision("high")
             except Exception:
                 pass
+        if self.device.type == "cpu":
+            try:
+                self._configure_cpu_runtime()
+            except Exception as e:
+                logger.warning(f"[CPU] runtime tuning skipped: {str(e)}")
 
     def _autocast_context(self):
         """Return autocast context when enabled and supported."""
@@ -106,15 +240,24 @@ class IndicF5InferenceEngine:
                 trust_remote_code=True
             )
             self.model = self.model.to(self.device)
+            self._compiled = False
+            self._cpu_optimized = False
 
-            if self.config.model.torch_compile and hasattr(torch, "compile"):
+            if (
+                self.config.model.torch_compile
+                and hasattr(torch, "compile")
+                and self.device.type == "cuda"
+            ):
                 try:
                     self.model = torch.compile(self.model, mode=self.config.model.compile_mode)
+                    self._compiled = True
                     logger.info(f"Applied torch.compile(mode={self.config.model.compile_mode})")
                 except Exception as e:
                     logger.warning(f"torch.compile skipped: {str(e)}")
 
             self.model.eval()
+            if self.device.type == "cpu":
+                self._optimize_model_for_cpu()
             self._warmup()
             
             logger.info("Model loaded successfully")
@@ -136,10 +279,43 @@ class IndicF5InferenceEngine:
             device: Device string ('cuda' or 'cpu')
         """
         try:
+            previous_device = self.device
             self.device = torch.device(device)
             self._configure_runtime()
+
+            # torch.compile artifacts can retain CUDA assumptions.
+            # Reloading model on CPU is safer for real CPU-only inference.
+            should_reload = (
+                self.model is not None
+                and previous_device.type == "cuda"
+                and self.device.type == "cpu"
+                and self._compiled
+            )
+
+            if should_reload:
+                logger.info("Reloading model for CPU mode to avoid CUDA-compiled graph usage")
+                self.model = None
+                self._compiled = False
+                self._cpu_optimized = False
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if not self.load_model():
+                    raise RuntimeError("Failed to reload model for CPU mode")
+
             if self.model is not None:
                 self.model = self.model.to(self.device)
+                if hasattr(self.model, "ema_model") and self.model.ema_model is not None:
+                    self.model.ema_model = self.model.ema_model.to(self.device)
+                if hasattr(self.model, "vocoder") and self.model.vocoder is not None:
+                    self.model.vocoder = self.model.vocoder.to(self.device)
+
+            if self.device.type == "cpu":
+                self._optimize_model_for_cpu()
+
+            if self.device.type == "cpu" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             logger.info(f"Models moved to device: {device}")
         except Exception as e:
             logger.error(f"Failed to move models to device: {str(e)}", exc_info=True)
@@ -212,7 +388,9 @@ class IndicF5InferenceEngine:
         nfe_steps: int | None = None,
         cfg_strength: float | None = None,
         remove_silence: bool = True,
-    ) -> Tuple[np.ndarray, int]:
+        min_silence_duration_ms: int = 1000,
+        silence_threshold_db: int = -50,
+    ) -> Tuple[np.ndarray, int, dict]:
         """
         Synthesize speech from text
         
@@ -221,7 +399,9 @@ class IndicF5InferenceEngine:
             ref_text: Reference text 
             gen_text: Text to generate
             speed: Speed multiplier
-            remove_silence: Whether to remove silence
+            remove_silence: Whether to remove silence gaps
+            min_silence_duration_ms: Minimum silence duration in milliseconds (default: 1000ms)
+            silence_threshold_db: Silence threshold in dB (default: -50dB)
             
         Returns:
             Tuple of (audio_array, sample_rate)
@@ -237,7 +417,13 @@ class IndicF5InferenceEngine:
                 if not self.load_all_models():
                     raise RuntimeError("Failed to load models")
             
-            logger.info("Starting synthesis...")
+            logger.info(
+                "[GEN] start device=%s nfe_steps=%s cfg_strength=%s speed=%.2f",
+                self.device,
+                nfe_steps if nfe_steps is not None else self.config.inference.nfe_steps,
+                cfg_strength if cfg_strength is not None else self.config.inference.cfg_strength,
+                float(speed),
+            )
             
             # Prepare text
             logger.debug("Preparing text...")
@@ -246,7 +432,10 @@ class IndicF5InferenceEngine:
             effective_cfg_strength = float(
                 cfg_strength if cfg_strength is not None else self.config.inference.cfg_strength
             )
-            effective_nfe_steps = max(8, min(64, effective_nfe_steps))
+            if self.device.type == "cpu":
+                effective_nfe_steps = max(4, min(24, effective_nfe_steps))
+            else:
+                effective_nfe_steps = max(8, min(64, effective_nfe_steps))
             effective_cfg_strength = max(0.5, min(5.0, effective_cfg_strength))
 
             if hasattr(self.model, "config"):
@@ -262,7 +451,7 @@ class IndicF5InferenceEngine:
 
             if hasattr(self.model, "ema_model") and hasattr(self.model, "vocoder"):
                 try:
-                    from f5_tts.infer.utils_infer import infer_process, preprocess_ref_audio_text
+                    from f5_tts.infer.utils_infer import infer_process
 
                     logger.info(
                         "[GEN] fast-path=ema_model nfe_steps=%d cfg_strength=%.2f speed=%.2f",
@@ -271,7 +460,7 @@ class IndicF5InferenceEngine:
                         float(speed),
                     )
 
-                    ref_audio, processed_ref_text = preprocess_ref_audio_text(ref_audio_path, ref_text)
+                    ref_audio, processed_ref_text = self._get_preprocessed_reference(ref_audio_path, ref_text)
 
                     with torch.no_grad(), self._autocast_context():
                         generated_wave, _, _ = infer_process(
@@ -313,8 +502,12 @@ class IndicF5InferenceEngine:
             
             # Remove silence if requested
             if remove_silence:
-                logger.debug("Removing silence...")
-                generated_wave = self._remove_silence(generated_wave)
+                logger.debug(f"Removing silence (min_duration={min_silence_duration_ms}ms, threshold={silence_threshold_db}dB)...")
+                generated_wave = self._remove_silence(
+                    generated_wave,
+                    min_silence_len=min_silence_duration_ms,
+                    silence_thresh=silence_threshold_db
+                )
             
             latency = time.time() - start_time
             audio_sec = max(len(generated_wave) / sr, 1e-6)
@@ -337,7 +530,15 @@ class IndicF5InferenceEngine:
                 gpu_reserved_after,
             )
             
-            return generated_wave, sr
+            metrics = {
+                "total_time": float(latency),
+                "infer_time": float(infer_elapsed),
+                "audio_duration": float(audio_sec),
+                "rtf": float(rtf),
+                "device": str(self.device),
+                "chars": int(input_chars),
+            }
+            return generated_wave, sr, metrics
             
         except Exception as e:
             logger.error(f"Synthesis failed: {str(e)}", exc_info=True)
